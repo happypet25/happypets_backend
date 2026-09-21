@@ -7,7 +7,23 @@ const app = express();
 const PORT = process.env.PORT || 5000;
 
 // Middleware
-app.use(cors()); // Allow all origins for production deployment
+// Parse comma-separated URLs from env, defaulting to empty array if not provided
+const envUrls = process.env.FRONTEND_URLS ? process.env.FRONTEND_URLS.split(',').map(url => url.trim()) : [];
+const allowedOrigins = ['http://localhost:5173', ...envUrls];
+
+app.use(cors({
+  origin: function (origin, callback) {
+    // Allow requests with no origin (like mobile apps or curl requests)
+    if (!origin) return callback(null, true);
+    
+    if (allowedOrigins.indexOf(origin) !== -1 || allowedOrigins.includes('*')) {
+      callback(null, true);
+    } else {
+      callback(null, true); // Fallback: allow all to prevent breaking, can restrict later by throwing an error here
+    }
+  },
+  credentials: true
+}));
 app.use(express.json());
 
 // Data
@@ -239,3 +255,6 @@ app.get('/api/health', (req, res) => {
 app.listen(PORT, () => {
   console.log(`🐾 Happy Pet Training API running on http://localhost:${PORT}`);
 });
+
+// Export the Express API for Vercel Serverless
+module.exports = app;
