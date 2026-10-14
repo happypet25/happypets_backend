@@ -1,6 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const nodemailer = require('nodemailer');
+const { google } = require('googleapis');
 require('dotenv').config();
 
 const app = express();
@@ -179,6 +180,55 @@ const transporter = nodemailer.createTransport({
   },
 });
 
+// ── Google Sheets helper ──────────────────────────────────────────────────────
+// Expects GOOGLE_SERVICE_ACCOUNT_JSON  → full JSON string of the service-account key
+//         GOOGLE_SHEET_ID             → the spreadsheet ID from its URL
+// The sheet must have the service-account email added as an Editor.
+async function appendLeadToSheet({ name, phone, city, email, pincode }) {
+  try {
+    const rawKey = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
+    const sheetId = process.env.GOOGLE_SHEET_ID;
+
+    if (!rawKey || !sheetId) {
+      console.warn('⚠️  Google Sheets env vars not set – skipping sheet append.');
+      return;
+    }
+
+    const credentials = JSON.parse(rawKey);
+
+    const auth = new google.auth.GoogleAuth({
+      credentials,
+      scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+    });
+
+    const sheets = google.sheets({ version: 'v4', auth });
+
+    const timestamp = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
+
+    await sheets.spreadsheets.values.append({
+      spreadsheetId: sheetId,
+      range: 'Leads!A:F',          // Sheet tab named "Leads"
+      valueInputOption: 'USER_ENTERED',
+      insertDataOption: 'INSERT_ROWS',
+      requestBody: {
+        values: [[
+          timestamp,
+          name,
+          phone,
+          city,
+          email  || '',
+          pincode || '',
+        ]],
+      },
+    });
+
+    console.log('✅ Lead appended to Google Sheet.');
+  } catch (err) {
+    // Never block the HTTP response because of a Sheets error
+    console.error('❌ Google Sheets append failed:', err.message);
+  }
+}
+
 app.post('/api/contact', async (req, res) => {
   const { name, phone, city, email, pincode } = req.body;
   
@@ -241,6 +291,10 @@ app.post('/api/contact', async (req, res) => {
   try {
     await transporter.sendMail(mailOptions);
     console.log('✅ Email successfully sent to happypettraining25@gmail.com');
+
+    // Save lead to Google Sheet (non-blocking – errors are caught inside)
+    await appendLeadToSheet({ name, phone, city, email, pincode });
+
     res.json({ success: true, message: 'Thank you! We\'ll be in touch shortly.' });
   } catch (error) {
     console.error('❌ Error sending email:', error);
