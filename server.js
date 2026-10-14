@@ -184,6 +184,9 @@ const transporter = nodemailer.createTransport({
 // Expects GOOGLE_SERVICE_ACCOUNT_JSON  → full JSON string of the service-account key
 //         GOOGLE_SHEET_ID             → the spreadsheet ID from its URL
 // The sheet must have the service-account email added as an Editor.
+//
+// ⚠️  VERCEL FIX: Vercel double-escapes \n inside env vars, so `private_key`
+//     arrives as "\\n" instead of "\n". We repair this after JSON.parse().
 async function appendLeadToSheet({ name, phone, city, email, pincode }) {
   try {
     const rawKey = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
@@ -191,10 +194,21 @@ async function appendLeadToSheet({ name, phone, city, email, pincode }) {
 
     if (!rawKey || !sheetId) {
       console.warn('⚠️  Google Sheets env vars not set – skipping sheet append.');
-      return;
+      return { ok: false, reason: 'env vars missing' };
     }
 
-    const credentials = JSON.parse(rawKey);
+    let credentials;
+    try {
+      credentials = JSON.parse(rawKey);
+    } catch (parseErr) {
+      console.error('❌ Failed to parse GOOGLE_SERVICE_ACCOUNT_JSON:', parseErr.message);
+      return { ok: false, reason: 'JSON parse error: ' + parseErr.message };
+    }
+
+    // Fix Vercel's double-escaping of newlines in the private key
+    if (credentials.private_key) {
+      credentials.private_key = credentials.private_key.replace(/\\n/g, '\n');
+    }
 
     const auth = new google.auth.GoogleAuth({
       credentials,
@@ -223,11 +237,54 @@ async function appendLeadToSheet({ name, phone, city, email, pincode }) {
     });
 
     console.log('✅ Lead appended to Google Sheet.');
+    return { ok: true };
   } catch (err) {
     // Never block the HTTP response because of a Sheets error
     console.error('❌ Google Sheets append failed:', err.message);
+    return { ok: false, reason: err.message };
   }
 }
+
+// ── Debug endpoint: GET /api/debug-sheets ─────────────────────────────────────
+// Hit this from a browser to verify sheet connectivity without submitting a form.
+app.get('/api/debug-sheets', async (req, res) => {
+  const rawKey = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
+  const sheetId = process.env.GOOGLE_SHEET_ID;
+
+  if (!rawKey || !sheetId) {
+    return res.status(500).json({ ok: false, error: 'GOOGLE_SERVICE_ACCOUNT_JSON or GOOGLE_SHEET_ID env var is missing on server.' });
+  }
+
+  let credentials;
+  try {
+    credentials = JSON.parse(rawKey);
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: 'JSON.parse failed for GOOGLE_SERVICE_ACCOUNT_JSON: ' + e.message });
+  }
+
+  // Fix Vercel double-escaping
+  if (credentials.private_key) {
+    credentials.private_key = credentials.private_key.replace(/\\n/g, '\n');
+  }
+
+  try {
+    const auth = new google.auth.GoogleAuth({
+      credentials,
+      scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+    });
+    const sheets = google.sheets({ version: 'v4', auth });
+    // Just read sheet metadata to verify access
+    const meta = await sheets.spreadsheets.get({ spreadsheetId: sheetId, fields: 'spreadsheetId,properties/title,sheets/properties/title' });
+    return res.json({
+      ok: true,
+      spreadsheetTitle: meta.data.properties.title,
+      tabs: meta.data.sheets.map(s => s.properties.title),
+      serviceAccountEmail: credentials.client_email,
+    });
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: err.message, serviceAccountEmail: credentials.client_email, sheetId });
+  }
+});
 
 app.post('/api/contact', async (req, res) => {
   const { name, phone, city, email, pincode } = req.body;
@@ -288,18 +345,45 @@ app.post('/api/contact', async (req, res) => {
     html: htmlContent,
   };
 
+  let emailSent = false;
+  let sheetSaved = false;
+  let sheetError = null;
+
+  // ── Step 1: Send email ────────────────────────────────────────────────────
   try {
     await transporter.sendMail(mailOptions);
+    emailSent = true;
     console.log('✅ Email successfully sent to happypettraining25@gmail.com');
-
-    // Save lead to Google Sheet (non-blocking – errors are caught inside)
-    await appendLeadToSheet({ name, phone, city, email, pincode });
-
-    res.json({ success: true, message: 'Thank you! We\'ll be in touch shortly.' });
-  } catch (error) {
-    console.error('❌ Error sending email:', error);
-    res.status(500).json({ success: false, message: 'Failed to send email. Ensure backend environment variables are set.' });
+  } catch (emailErr) {
+    console.error('❌ Error sending email:', emailErr.message);
   }
+
+  // ── Step 2: Append to Google Sheet ───────────────────────────────────────
+  const sheetResult = await appendLeadToSheet({ name, phone, city, email, pincode });
+  sheetSaved = sheetResult?.ok === true;
+  sheetError = sheetResult?.reason || null;
+  if (!sheetSaved) console.warn('⚠️  Sheet append issue:', sheetError);
+
+  // ── Step 3: Respond based on outcomes ────────────────────────────────────
+  if (!emailSent && !sheetSaved) {
+    // Both failed — hard error
+    return res.status(500).json({
+      success: false,
+      emailSent: false,
+      sheetSaved: false,
+      message: 'Both email and sheet failed. Please check server env vars.',
+      sheetError,
+    });
+  }
+
+  // At least one succeeded — treat as success but expose partial failures
+  res.json({
+    success: true,
+    emailSent,
+    sheetSaved,
+    sheetError: sheetSaved ? null : sheetError,
+    message: 'Thank you! We\'ll be in touch shortly.',
+  });
 });
 
 app.get('/api/health', (req, res) => {
